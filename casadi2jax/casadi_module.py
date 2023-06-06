@@ -1,5 +1,7 @@
 import re
 
+import casadi as cs
+
 _look_up = {
     "@": "var",
     "log": "jnp.log",
@@ -18,9 +20,82 @@ _look_up = {
     "asinh": "jnp.arcsinh",
     "tanh": "jnp.tanh",
     "atanh": "jnp.arctanh",
-    "sq": "jnp.square",
+    "sq(": "jnp.square(",
 }
 
+
+def process_jax_expession(f, input_names, *args):
+    if 'sparse' in f.__str__():
+        text = f.__str__()
+        input_names, text_result = sparse_expession_2_text(text, input_names, *args)
+    else: 
+        text = f.__str__()
+
+        input_names, text_result = expession_2_text(text, input_names, *args)
+
+    return input_names, text_result
+
+def sparse_expession_2_text(expression, input_names, *args):
+    for key, value in _look_up.items():
+        expression = expression.replace(key, value)
+    expression = expression.replace(",", "")
+
+    for i in range(len(input_names) - 1, -1, -1):
+        print(input_names[i])
+        print(args[i].shape)
+        for j in range(args[i].shape[0], -1, -1):
+            expression = expression.replace(
+                input_names[i] + "_" + str(j), f"{input_names[i]}[" + str(j) + "]"
+            )
+    # read expression line by line  
+    expression_multi_line = expression.split("\n")
+    result_expression = []
+    
+    for i, line in enumerate(expression_multi_line):
+        # line = expression_multi_line[i]
+        if "sparse" in line:
+            line_parts = line.split(" ")[1]
+            output_sizes = line_parts.split("-by-")
+            output_array = f"\toutput = jnp.zeros(({output_sizes[0]}, {output_sizes[1]}))"
+            result_expression.append(output_array)
+            continue
+        # of line starts with var append line to result expression 
+        if "=" in line:
+            if line.split("= ")[0].strip().startswith("var"):
+                result_expression.append('\t'+line.replace(" ", ""))
+                continue
+        if '->' in line:
+            line = line.split('->')
+            output = f"\toutput = output.at{line[0].replace(' (', '[').replace(') ',']').replace(' ',',')}.set({line[1]})"
+            result_expression.append(output)
+        
+
+    result_expression.append('\treturn output\n')
+    return input_names, result_expression
+
+
+
+def expession_2_text(expression, input_names, *args):
+    for key, value in _look_up.items():
+        expression = expression.replace(key, value)
+
+    expression = expression.replace("[", "return jnp.array([").replace("]", "])")
+    for i in range(len(input_names) - 1, -1, -1):
+        print(input_names[i])
+        print(args[i].shape)
+        for j in range(args[i].shape[0], -1, -1):
+            expression = expression.replace(
+                input_names[i] + "_" + str(j), f"{input_names[i]}[" + str(j) + "]"
+            )
+    expression_multi_line = expression.split("return ")
+    expression_result = [
+        "\t" + line
+        for line in expression_multi_line[0].replace(", ", "\n").split("\n")
+        if line.strip() != ""
+    ]
+    expression_result.append("\treturn " + expression_multi_line[1])
+
+    return input_names, expression_result
 
 def process_jax_function(f, *args):
     input_names = []
@@ -30,35 +105,34 @@ def process_jax_function(f, *args):
             if element.shape[1] != 1:
                 raise ValueError("Only 1D arrays are supported")
             input_names.append(element[0].name().split("_0")[0])
-
+    
+    
     text = (f(*args)).__str__()
 
-    for key, value in _look_up.items():
-        text = text.replace(key, value)
 
-    text = text.replace("[", "return jnp.array([").replace("]", "])")
-    for i in range(len(input_names) - 1, -1, -1):
-        print(input_names[i])
-        print(args[i].shape)
-        for j in range(args[i].shape[0], -1, -1):
-            text = text.replace(
-                input_names[i] + "_" + str(j), f"{input_names[i]}[" + str(j) + "]"
-            )
-    text_multi_line = text.split("return ")
-    text_result = [
-        "\t" + line
-        for line in text_multi_line[0].replace(", ", "\n").split("\n")
-        if line.strip() != ""
-    ]
-    text_result.append("\treturn " + text_multi_line[1])
+    input_names, text_result = process_jax_expession(text, input_names, *args)
 
     return input_names, text_result
 
 
-def generate_jax_function(f, *args):
-    input_names, text_result = process_jax_function(f, *args)
-
-    with open(f"{f.name()}_jax.py", "w") as file:
+def generate_jax_function(f, *args, **kwargs):
+    if 'out_dir' in kwargs:
+        out_dir = kwargs['out_dir'] + '/'
+        kwargs.pop('out_dir')
+    else:
+        out_dir = ''
+    if type(f)  == cs.casadi.Function:
+        input_names, text_result = process_jax_function(f, *args)
+    elif type(f) == cs.casadi.SX or type(f) == cs.casadi.MX:
+        input_names = []
+        for element in args:
+            if element.shape != (1, 1):
+                if element.shape[1] != 1:
+                    raise ValueError("Only 1D arrays are supported")
+                input_names.append(element[0].name().split("_0")[0])
+        input_names, text_result = process_jax_expession(f, input_names, *args)
+    
+    with open(f"{out_dir}{f.name()}_jax.py", "w") as file:
         file.write("import jax.numpy as jnp\n")
         file.write("import numpy as np\n")
         file.write("import jax\n")
@@ -75,6 +149,7 @@ def generate_jax_function(f, *args):
 
 
 def generate_jax_function_params(f, *args):
+    # TODO: add support for sparse functions
     input_names, text_result = process_jax_function(f, *args)
     params = []
     numeric_const_pattern = (
